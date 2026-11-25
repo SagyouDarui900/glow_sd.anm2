@@ -1,0 +1,713 @@
+--label:光効果
+--information:グロー_sd
+--filter
+
+--group:抽出・露出
+--select@luma_type:抽出基準=1,Rec.709(実写向け)=0,最大値(イラスト向け)=1
+--track@threshold:抽出閾値,0.0,1.0,0.2,0.01
+--track@softness:閾値の柔らかさ,0.0,1.0,0.5,0.01
+--track@exposure:発光強度,0.0,20.0,1.0,0.01
+--track@highlight:ハイライト強調,0.0,10.0,1.0,0.01
+--check@use_color_key:特定色のみ抽出,0
+--color@key_color:抽出対象色,0xff0000
+--track@key_tolerance:色の許容幅,0.01,1.0,0.25,0.01
+--track@key_softness:色の境界の柔らかさ,0.0,1.0,0.5,0.01
+--hide@key_color:use_color_key==0
+--hide@key_tolerance:use_color_key==0
+--hide@key_softness:use_color_key==0
+--group
+
+--group:拡散・減衰
+--track@radius:拡散半径,0,2000,100,1
+--track@spread:サンプリング幅,0.1,5.0,1.0,0.01
+--track@aspect:縦横拡散比,-1.0,1.0,0.0,0.01
+--track@aspect_angle:拡散の回転角度,-360.0,360.0,0.0,0.1
+--track@falloff:減衰の滑らかさ,0.5,4.0,2.0,0.01
+--track@core_boost:芯の強調,0.0,5.0,0.0,0.01
+--group
+
+--group:カラー・オプション
+--check@preserve_hue:色相・彩度を維持,1
+--check@color_override:単色グロー化,0
+--color@glow_color:グロー色,0xffffff
+--track@rad_r:赤拡散補正,0.0,2.0,1.0,0.01
+--track@rad_g:緑拡散補正,0.0,2.0,1.0,0.01
+--track@rad_b:青拡散補正,0.0,2.0,1.0,0.01
+--trackgroup@rad_r,rad_g,rad_b:波長拡散補正
+--hide@glow_color:color_override==0
+--group
+
+--group:出力・合成
+--track@intensity:合成強度,0.0,20.0,1.0,0.01
+--select@glow_area:発光範囲=0,全体=0,外側のみ=1,内側のみ=2
+--select@tone_map:トーン制御=1,なし=0,フィルムロールオフ=1,ACES(近似)=2,Reinhard=3,Uncharted 2=4,ソフトカーブ=5,S字カーブ=6,ソフトクリップ=7,Lottes Filmic=8,Uchimura=9,Khronos PBR Neutral=10,ACES Fitted=11,AgX=12
+--track@highlight_roll:トーン調整,0.1,10.0,1.0,0.01
+--select@blend_mode:合成モード=0,加算=0,スクリーン=1,グローのみ=2,抽出プレビュー=3
+--hide@glow_area:blend_mode==3
+--hide@preserve_hue:tone_map==0
+--hide@highlight_roll:tone_map==0
+--group
+
+--[[pixelshader@extract_ps:
+cbuffer Params : register(b0) {
+    float4 param_ext;
+    float4 param_col;
+    float4 param_opt;
+    float4 param_key;
+};
+
+Texture2D srcTex : register(t0);
+SamplerState srcSmp : register(s0);
+
+float3 srgb2linear(float3 c) {
+    float3 c_pos = max(c, 0.0);
+    return lerp(c_pos / 12.92, pow((c_pos + 0.055) / 1.055, 2.4), step(0.04045, c_pos));
+}
+
+float4 extract_ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 col = srcTex.SampleLevel(srcSmp, uv, 0.0);
+    if (col.a <= 1e-5) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float a = saturate(col.a);
+    float3 straight_rgb = max(col.rgb / col.a, 0.0);
+    float3 linear_rgb = srgb2linear(straight_rgb);
+
+    float luma = (param_opt.x > 0.5)
+        ? max(max(linear_rgb.r, linear_rgb.g), linear_rgb.b)
+        : dot(linear_rgb, float3(0.2126, 0.7152, 0.0722));
+
+    float th = param_ext.x;
+    float knee = max(th * saturate(param_ext.y), 1e-4);
+
+    // ソフトニー計算
+    float soft = clamp(luma - th + knee, 0.0, 2.0 * knee);
+    float soft_sq = (soft * soft) / (4.0 * knee);
+    float extracted_luma = max(soft_sq, luma - th);
+
+    if (extracted_luma <= 0.0 || luma <= 1e-5) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    // 特定色抽出（最大成分正規化による色度距離判定）
+    if (param_opt.y > 0.5) {
+        float src_max = max(max(linear_rgb.r, linear_rgb.g), linear_rgb.b);
+        float3 src_chroma = (src_max > 1e-5) ? (linear_rgb / src_max) : float3(0.0, 0.0, 0.0);
+
+        float3 key_lin = param_key.xyz;
+        float key_max = max(max(key_lin.r, key_lin.g), key_lin.b);
+        float3 key_chroma = (key_max > 1e-5) ? (key_lin / key_max) : float3(0.0, 0.0, 0.0);
+
+        float dist = length(src_chroma - key_chroma) / 1.7320508;
+        float tol = param_opt.z;
+        float feather = max(tol * saturate(param_opt.w), 1e-4);
+        float color_mask = 1.0 - smoothstep(max(0.0, tol - feather * 0.5), tol + feather * 0.5, dist);
+
+        extracted_luma *= color_mask;
+        if (extracted_luma <= 0.0) {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
+    }
+
+    float weight = extracted_luma / luma;
+    float exp_val = param_ext.z;
+    float hl_val = param_ext.w;
+    float boost = max(0.0, 1.0 + extracted_luma * (hl_val - 1.0));
+
+    float3 base_glow = lerp(linear_rgb * weight, param_col.yzw * extracted_luma, param_col.x);
+    float3 glow_rad = base_glow * (exp_val * boost);
+
+    return float4(glow_rad * a, a);
+}
+]]
+
+--[[pixelshader@downsample_ps:
+cbuffer Params : register(b0) {
+    float4 param_down;
+};
+
+Texture2D srcTex : register(t0);
+SamplerState srcSmp : register(s0);
+
+float4 downsample_ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float2 vx = param_down.xy;
+    float2 vy = param_down.zw;
+
+    float4 a = srcTex.SampleLevel(srcSmp, uv - 2.0*vx - 2.0*vy, 0.0);
+    float4 b = srcTex.SampleLevel(srcSmp, uv          - 2.0*vy, 0.0);
+    float4 c = srcTex.SampleLevel(srcSmp, uv + 2.0*vx - 2.0*vy, 0.0);
+    float4 d = srcTex.SampleLevel(srcSmp, uv - 2.0*vx,          0.0);
+    float4 e = srcTex.SampleLevel(srcSmp, uv,                   0.0);
+    float4 f = srcTex.SampleLevel(srcSmp, uv + 2.0*vx,          0.0);
+    float4 g = srcTex.SampleLevel(srcSmp, uv - 2.0*vx + 2.0*vy, 0.0);
+    float4 h = srcTex.SampleLevel(srcSmp, uv          + 2.0*vy, 0.0);
+    float4 i = srcTex.SampleLevel(srcSmp, uv + 2.0*vx + 2.0*vy, 0.0);
+    float4 j = srcTex.SampleLevel(srcSmp, uv - vx - vy, 0.0);
+    float4 k = srcTex.SampleLevel(srcSmp, uv + vx - vy, 0.0);
+    float4 l = srcTex.SampleLevel(srcSmp, uv - vx + vy, 0.0);
+    float4 m = srcTex.SampleLevel(srcSmp, uv + vx + vy, 0.0);
+
+    float4 sum = e * 0.125;
+    sum += (a + c + g + i) * 0.03125;
+    sum += (b + d + f + h) * 0.0625;
+    sum += (j + k + l + m) * 0.125;
+
+    return sum;
+}
+]]
+
+--[[pixelshader@upsample_ps:
+cbuffer Params : register(b0) {
+    float4 param_up;
+    float4 param_color;
+    float4 param_extra;
+};
+
+Texture2D lowerTex : register(t0);
+Texture2D currentTex : register(t1);
+SamplerState srcSmp : register(s0);
+
+float4 upsample_ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float2 vx = param_up.xy;
+    float2 vy = param_up.zw;
+
+    float4 a = lowerTex.SampleLevel(srcSmp, uv - vx - vy, 0.0);
+    float4 b = lowerTex.SampleLevel(srcSmp, uv      - vy, 0.0);
+    float4 c = lowerTex.SampleLevel(srcSmp, uv + vx - vy, 0.0);
+    float4 d = lowerTex.SampleLevel(srcSmp, uv - vx,      0.0);
+    float4 e = lowerTex.SampleLevel(srcSmp, uv,           0.0);
+    float4 f = lowerTex.SampleLevel(srcSmp, uv + vx,      0.0);
+    float4 g = lowerTex.SampleLevel(srcSmp, uv - vx + vy, 0.0);
+    float4 h = lowerTex.SampleLevel(srcSmp, uv      + vy, 0.0);
+    float4 i = lowerTex.SampleLevel(srcSmp, uv + vx + vy, 0.0);
+
+    float4 blur = e * 0.25;
+    blur += (b + d + f + h) * 0.125;
+    blur += (a + c + g + i) * 0.0625;
+
+    blur.rgb *= param_color.rgb;
+
+    float4 cur = currentTex.SampleLevel(srcSmp, uv, 0.0);
+    return (cur * param_color.w) + (blur * param_extra.x);
+}
+]]
+
+--[[pixelshader@composite_ps:
+cbuffer Params : register(b0) {
+    float4 param_comp;
+    float4 param_extra;
+};
+
+Texture2D origTex : register(t0);
+Texture2D bloomTex : register(t1);
+SamplerState srcSmp : register(s0);
+
+static const float3x3 ACESInputMat = float3x3(
+    0.59719, 0.35458, 0.04823,
+    0.07600, 0.90834, 0.01566,
+    0.02840, 0.13383, 0.83777
+);
+static const float3x3 ACESOutputMat = float3x3(
+     1.60475, -0.53108, -0.07367,
+    -0.10208,  1.10813, -0.00605,
+    -0.00327, -0.07276,  1.07602
+);
+
+static const float3x3 AgXInsetMat = float3x3(
+    0.842479062253094,  0.0784335999999992, 0.0792237451477643,
+    0.0423282422610123, 0.878468636469772,  0.0791661274605434,
+    0.0423756549057051, 0.0784336,          0.879142973793104
+);
+static const float3x3 AgXOutsetMat = float3x3(
+     1.19687900512017,  -0.0980208811401368, -0.0990297440797205,
+    -0.0528968517574562, 1.15190312990417,   -0.0989611768448433,
+    -0.0529716355144438, -0.0980434501171241, 1.15107367264116
+);
+
+float3 srgb2linear(float3 c) {
+    float3 c_pos = max(c, 0.0);
+    return lerp(c_pos / 12.92, pow((c_pos + 0.055) / 1.055, 2.4), step(0.04045, c_pos));
+}
+
+float3 linear2srgb(float3 c) {
+    float3 c_pos = max(c, 0.0);
+    return lerp(c_pos * 12.92, 1.055 * pow(max(c_pos, 1e-6), 1.0 / 2.4) - 0.055, step(0.0031308, c_pos));
+}
+
+float hable_func(float x) {
+    float A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
+    return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+
+float apply_tonemap_scalar(float x, int mode, float roll) {
+    float r = max(roll, 0.01);
+    float res = x;
+
+    if (mode == 1) {
+        res = 1.0 - exp(-x * r);
+    } else if (mode == 2) {
+        float v = x * r;
+        res = saturate((v * (2.51 * v + 0.03)) / (v * (2.43 * v + 0.59) + 0.14));
+    } else if (mode == 3) {
+        float w = max(r, 0.1);
+        res = (x * (1.0 + x / (w * w))) / (1.0 + x);
+    } else if (mode == 4) {
+        float curr = hable_func(x * 2.0 * r);
+        float white_scale = 1.0 / max(1e-4, hable_func(11.2));
+        res = curr * white_scale;
+    } else if (mode == 5) {
+        float v = x * r;
+        float s = v / (v + 0.18);
+        res = pow(max(s, 1e-6), 1.2);
+    } else if (mode == 6) {
+        float k = max(r * 2.0, 1e-4);
+        float offset = 1.0 / (1.0 + exp(k * 0.5));
+        float denom = max(1.0 - 2.0 * offset, 1e-4);
+        res = saturate((1.0 / (1.0 + exp(-k * (x - 0.5))) - offset) / denom);
+    } else if (mode == 7) {
+        float thresh = 1.0 / max(r, 0.1);
+        if (x < thresh) {
+            res = x;
+        } else {
+            res = thresh + (1.0 - thresh) * (1.0 - exp(-(x - thresh) / max(1.0 - thresh, 1e-4)));
+        }
+    } else if (mode == 8) {
+        float a = max(1.6 * pow(r, 0.5), 0.1);
+        float d = 0.977;
+        float midIn = 0.18;
+        float midOut = 0.18;
+        float powMidOut = max(1e-5, pow(midOut, a));
+        float powMidIn = pow(midIn, a);
+        float denom = max(1e-4, powMidOut * (1.0 - d));
+        float b = (-powMidIn + powMidOut * d) / denom;
+        float c = (powMidIn * powMidOut * d) / denom;
+        float x_a = pow(max(x, 1e-6), a);
+        res = x_a / max(1e-4, x_a * b + c);
+    } else if (mode == 9) {
+        float P = 1.0;
+        float a = 1.0;
+        float m = clamp(0.22 / r, 0.05, 0.8);
+        float l = 0.4;
+        float c = 1.33;
+        float b = 0.0;
+
+        float l0 = ((P - m) * l) / a;
+        float S0 = m + l0;
+        float S1 = m + a * l0;
+        float C2 = (a * P) / max(P - S1, 1e-4);
+        float CP = -C2 / P;
+
+        float w0 = 1.0 - smoothstep(0.0, m, x);
+        float w2 = step(m + l0, x);
+        float w1 = 1.0 - w0 - w2;
+
+        float T = m * pow(max(x / m, 1e-6), c) + b;
+        float S = P - (P - S1) * exp(CP * (x - S0));
+        float L = m + a * (x - m);
+
+        res = T * w0 + L * w1 + S * w2;
+    }
+
+    return res;
+}
+
+float3 tonemap_pbr_neutral(float3 color, float roll) {
+    float3 c = max(color * roll, 0.0);
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation = 0.15;
+
+    float x = min(c.r, min(c.g, c.b));
+    float offset = (x < 0.08) ? (x - 6.25 * x * x) : 0.04;
+    c -= offset;
+
+    float peak = max(c.r, max(c.g, c.b));
+    if (peak < startCompression) {
+        return c;
+    }
+
+    const float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    c *= newPeak / peak;
+
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return lerp(c, newPeak.xxx, g);
+}
+
+float3 tonemap_aces_fitted(float3 color, float roll) {
+    float3 v = mul(ACESInputMat, max(color * roll, 0.0));
+    float3 a = v * (v + 0.0245786) - 0.000090537;
+    float3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
+    v = a / max(b, 1e-4);
+    return saturate(mul(ACESOutputMat, v));
+}
+
+float3 tonemap_agx(float3 color, float roll) {
+    const float minEv = -12.47393;
+    const float maxEv = 4.026069;
+
+    float3 val = mul(AgXInsetMat, max(color * roll, 0.0));
+    val = clamp(log2(max(val, 1e-10)), minEv, maxEv);
+    val = (val - minEv) / (maxEv - minEv);
+
+    float3 x2 = val * val;
+    float3 x4 = x2 * x2;
+    val = + 15.5     * x4 * x2
+          - 40.14    * x4 * val
+          + 31.96    * x4
+          - 6.868    * x2 * val
+          + 0.4298   * x2
+          + 0.1191   * val
+          - 0.00232;
+
+    val = mul(AgXOutsetMat, val);
+    return srgb2linear(saturate(val));
+}
+
+float3 apply_tonemap_rgb(float3 c, int mode, float roll) {
+    if (mode == 10) {
+        return tonemap_pbr_neutral(c, roll);
+    } else if (mode == 11) {
+        return tonemap_aces_fitted(c, roll);
+    } else if (mode == 12) {
+        return tonemap_agx(c, roll);
+    }
+
+    return float3(
+        apply_tonemap_scalar(c.r, mode, roll),
+        apply_tonemap_scalar(c.g, mode, roll),
+        apply_tonemap_scalar(c.b, mode, roll)
+    );
+}
+
+float3 process_tonemap(float3 lin_c, int mode, float roll, float preserve_hue_flag) {
+    if (mode <= 0) {
+        return lin_c;
+    }
+    if (preserve_hue_flag > 0.5) {
+        float luma = dot(lin_c, float3(0.2126, 0.7152, 0.0722));
+        if (luma > 1e-5) {
+            float mapped_luma = (mode >= 10)
+                ? dot(apply_tonemap_rgb(luma.xxx, mode, roll), float3(0.2126, 0.7152, 0.0722))
+                : apply_tonemap_scalar(luma, mode, roll);
+            return lin_c * (mapped_luma / luma);
+        }
+        return lin_c;
+    }
+    return apply_tonemap_rgb(lin_c, mode, roll);
+}
+
+float4 composite_ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 bloom = bloomTex.SampleLevel(srcSmp, uv, 0.0);
+
+    float bloom_intensity = param_comp.x;
+    int mode = (int)(param_comp.y + 0.5);
+    int blend = (int)(param_comp.z + 0.5);
+    int area = (int)(param_comp.w + 0.5);
+    float roll = max(0.01, param_extra.x);
+    float preserve_hue_flag = param_extra.y;
+    float frame_seed = param_extra.z;
+
+    float3 bloom_premult_lin = max(bloom.rgb, 0.0) * bloom_intensity;
+
+    float4 orig = float4(0.0, 0.0, 0.0, 0.0);
+    float orig_a = 0.0;
+    if (blend != 2 || area != 0) {
+        orig = origTex.SampleLevel(srcSmp, uv, 0.0);
+        orig_a = saturate(orig.a);
+    }
+
+    // 発光範囲の制限（0:全体, 1:外側のみ, 2:内側のみ）
+    float bg_area_mask = (area == 2) ? 0.0 : 1.0;
+    float fg_area_mask = (area == 1) ? (1.0 - orig_a) : 1.0;
+
+    // 透明背景へ漏れるグロー単体のトーンマップとアルファ算出
+    float3 bg_bloom_lin = bloom_premult_lin * bg_area_mask;
+    float3 mapped_bloom_lin = process_tonemap(bg_bloom_lin, mode, roll, preserve_hue_flag);
+    float max_mapped_bloom = max(mapped_bloom_lin.r, max(mapped_bloom_lin.g, mapped_bloom_lin.b));
+    float bloom_a = saturate(max(bloom.a * bloom_intensity * bg_area_mask, max_mapped_bloom));
+
+    float3 bg_srgb_premult = float3(0.0, 0.0, 0.0);
+    if (bloom_a > 1e-5) {
+        float3 bloom_straight_lin = mapped_bloom_lin / bloom_a;
+        bg_srgb_premult = linear2srgb(max(bloom_straight_lin, 0.0)) * bloom_a;
+    }
+
+    float out_a = bloom_a;
+    float3 out_srgb_premult = bg_srgb_premult;
+
+    if (blend != 2) {
+        if (orig_a > 1e-5) {
+            float3 orig_straight_lin = srgb2linear(max(orig.rgb / orig.a, 0.0));
+            float3 fg_bloom_lin = bloom_premult_lin * fg_area_mask;
+            float3 fg_lin = (blend == 1)
+                ? (orig_straight_lin + fg_bloom_lin / (1.0 + orig_straight_lin))
+                : (orig_straight_lin + fg_bloom_lin);
+
+            float3 mapped_fg_lin = process_tonemap(fg_lin, mode, roll, preserve_hue_flag);
+            float3 fg_srgb_premult = linear2srgb(max(mapped_fg_lin, 0.0)) * orig_a;
+
+            out_a = saturate(orig_a + bloom_a * (1.0 - orig_a));
+            out_srgb_premult = fg_srgb_premult + bg_srgb_premult * (1.0 - orig_a);
+        }
+    } else if (area != 0) {
+        // 「グローのみ」かつ「外側のみ(1)」または「内側のみ(2)」の場合、元画像のアルファ形状でマスク
+        float area_mask = (area == 1) ? (1.0 - orig_a) : orig_a;
+        float3 masked_bloom_lin = bloom_premult_lin * area_mask;
+        float3 mapped_masked_lin = process_tonemap(masked_bloom_lin, mode, roll, preserve_hue_flag);
+        float max_masked = max(mapped_masked_lin.r, max(mapped_masked_lin.g, mapped_masked_lin.b));
+        out_a = saturate(min(area_mask, max(bloom.a * bloom_intensity * area_mask, max_masked)));
+        if (out_a > 1e-5) {
+            out_srgb_premult = linear2srgb(max(mapped_masked_lin / out_a, 0.0)) * out_a;
+        } else {
+            out_srgb_premult = float3(0.0, 0.0, 0.0);
+        }
+    }
+
+    if (out_a <= 1e-5) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    // ディザリングの適用（アルファ範囲内にクランプ）
+    float noise = frac(52.9829189 * frac(dot(pos.xy + frame_seed, float2(0.06711056, 0.00583715))));
+    float dither = ((noise - 0.5) / 255.0) * out_a;
+    out_srgb_premult = clamp(out_srgb_premult + dither, 0.0, out_a);
+
+    return float4(out_srgb_premult, out_a);
+}
+]]
+
+if obj.w <= 0 or obj.h <= 0 then
+    return
+end
+
+local is_preview = (blend_mode == 3)
+
+if not is_preview and (intensity <= 0 or radius <= 0) then
+    if blend_mode == 2 then
+        obj.clearbuffer("object", math.max(1, math.floor(obj.w)), math.max(1, math.floor(obj.h)))
+    end
+    return
+end
+
+local max_w, max_h = obj.getinfo("image_max")
+if max_w and max_w > 0 and max_h and max_h > 0 then
+    if obj.w > max_w or obj.h > max_h then
+        return
+    end
+end
+
+-- 一意なキャッシュバッファキーの生成
+local obj_id = obj.id or 0
+local effect_id = obj.effect_id or 0
+local obj_index = obj.index or 0
+local render_id = obj.getinfo("rendering_id") or 0
+local obj_key = string.format("%d_%d_%d_%d", obj_id, effect_id, obj_index, render_id)
+local cache_orig = "cache:glow_orig_" .. obj_key
+
+local asp_x = (aspect > 0.0) and 1.0 or (1.0 + aspect)
+local asp_y = (aspect < 0.0) and 1.0 or (1.0 - aspect)
+local angle_rad = math.rad(aspect_angle)
+local cos_a = math.cos(angle_rad)
+local sin_a = math.sin(angle_rad)
+
+local is_filter = obj.getinfo("filter")
+
+-- プレビュー時および「内側のみ」設定時は領域拡張をスキップ
+if not is_preview and glow_area ~= 2 and max_w and max_w > 0 and max_h and max_h > 0 and not is_filter then
+    local pad_base = radius * spread * 2.0
+    local rx = pad_base * asp_x
+    local ry = pad_base * asp_y
+    local pad_x_req = math.sqrt((rx * cos_a) ^ 2 + (ry * sin_a) ^ 2)
+    local pad_y_req = math.sqrt((rx * sin_a) ^ 2 + (ry * cos_a) ^ 2)
+
+    local pad_x = math.floor(math.max(math.min(pad_x_req, (max_w - obj.w) / 2), 0))
+    local pad_y = math.floor(math.max(math.min(pad_y_req, (max_h - obj.h) / 2), 0))
+    if pad_x > 0 or pad_y > 0 then
+        obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
+    end
+end
+
+-- 元画像のコピー成否を確認
+if not obj.copybuffer(cache_orig, "object") then
+    return
+end
+
+local w = math.max(1, math.floor(obj.w))
+local h = math.max(1, math.floor(obj.h))
+if max_w and max_w > 0 then
+    w = math.min(w, max_w)
+end
+if max_h and max_h > 0 then
+    h = math.min(h, max_h)
+end
+
+local function srgb2linear_lua(c)
+    if c <= 0.04045 then
+        return c / 12.92
+    else
+        return ((c + 0.055) / 1.055) ^ 2.4
+    end
+end
+
+local is_color_override = (color_override == 1) and 1.0 or 0.0
+local is_luma_type = (luma_type == 1) and 1.0 or 0.0
+local is_color_key = (use_color_key == 1) and 1.0 or 0.0
+
+local r, g, b = RGB(glow_color)
+local lr = srgb2linear_lua(r / 255.0)
+local lg = srgb2linear_lua(g / 255.0)
+local lb = srgb2linear_lua(b / 255.0)
+
+local kr, kg, kb = RGB(key_color)
+local klr = srgb2linear_lua(kr / 255.0)
+local klg = srgb2linear_lua(kg / 255.0)
+local klb = srgb2linear_lua(kb / 255.0)
+
+local buf_extract = "cache:glow_down_" .. obj_key .. "_0"
+obj.clearbuffer(buf_extract, w, h)
+obj.pixelshader(
+    "extract_ps",
+    buf_extract,
+    { cache_orig },
+    {
+        threshold, softness, exposure, highlight,
+        is_color_override, lr, lg, lb,
+        is_luma_type, is_color_key, key_tolerance, key_softness,
+        klr, klg, klb, 0.0
+    },
+    "copy",
+    "clip"
+)
+
+local is_preserve_hue = (preserve_hue == 1) and 1.0 or 0.0
+local frame_seed = (obj.frame * 0.6180339887) % 100.0
+
+-- 抽出プレビュー時はぼかし処理をスキップして直接表示
+if is_preview then
+    obj.pixelshader(
+        "composite_ps",
+        "object",
+        { cache_orig, buf_extract },
+        {
+            1.0, tone_map, 2.0, 0.0,
+            highlight_roll, is_preserve_hue, frame_seed, 0.0
+        },
+        "copy",
+        "clip"
+    )
+    return
+end
+
+-- 最大11パス (2^11 = 2048px) までピラミッド縮小を許容
+local max_passes = 11
+local log2_r = math.max(math.log(math.max(1.0, radius)) / math.log(2.0), 0.05)
+local n_full = math.min(math.floor(log2_r), max_passes)
+local partial_level = log2_r - n_full
+local passes = math.min(n_full + (partial_level > 0 and 1 or 0), max_passes)
+
+local max_covered_radius = 2 ^ max_passes
+local extra_spread = math.max(1.0, radius / max_covered_radius)
+local eff_spread = spread * extra_spread
+
+local widths = { [0] = w }
+local heights = { [0] = h }
+local actual_passes = 0
+for k = 1, passes do
+    if math.max(widths[k - 1], heights[k - 1]) <= 1 then
+        break
+    end
+    widths[k] = math.max(1, math.ceil(widths[k - 1] / 2))
+    heights[k] = math.max(1, math.ceil(heights[k - 1] / 2))
+    actual_passes = k
+end
+passes = actual_passes
+
+local down_buf = { [0] = buf_extract }
+for k = 1, passes do
+    down_buf[k] = "cache:glow_down_" .. obj_key .. "_" .. k
+end
+
+local blur_sampler = is_filter and "clamp" or "clip"
+
+-- ピクセル空間での異方性スケール＋回転をUV空間の基底ベクトルへ変換
+local function calc_rotated_uv_basis(tex_w, tex_h)
+    local inv_w = 1.0 / tex_w
+    local inv_h = 1.0 / tex_h
+    local sx = eff_spread * asp_x
+    local sy = eff_spread * asp_y
+    local vx_x = (sx * cos_a) * inv_w
+    local vx_y = (sx * sin_a) * inv_h
+    local vy_x = (-sy * sin_a) * inv_w
+    local vy_y = (sy * cos_a) * inv_h
+    return vx_x, vx_y, vy_x, vy_y
+end
+
+for i = 1, passes do
+    local vx_x, vx_y, vy_x, vy_y = calc_rotated_uv_basis(widths[i - 1], heights[i - 1])
+    obj.clearbuffer(down_buf[i], widths[i], heights[i])
+    obj.pixelshader(
+        "downsample_ps",
+        down_buf[i],
+        { down_buf[i - 1] },
+        { vx_x, vx_y, vy_x, vy_y },
+        "copy",
+        blur_sampler
+    )
+end
+
+local partial = (partial_level > 0 and passes == n_full + 1)
+local q = 2.0 ^ (2.0 - falloff)
+local total_weight = (passes > 0) and (1.0 + core_boost) or 1.0
+local coeff = 1.0
+
+for k = 1, passes do
+    coeff = coeff * q
+    total_weight = total_weight + (partial and k == passes and coeff * partial_level or coeff)
+end
+
+local up_ping = "cache:glow_up_a_" .. obj_key
+local up_pong = "cache:glow_up_b_" .. obj_key
+local current_src = down_buf[passes]
+
+for i = passes - 1, 0, -1 do
+    local wl = (partial and i == passes - 1) and (q * partial_level) or q
+    local core_scale = (i == 0) and (1.0 + core_boost) or 1.0
+
+    local depth_ratio = (i + 1) / passes
+    local cr = 1.0 + (rad_r - 1.0) * depth_ratio
+    local cg = 1.0 + (rad_g - 1.0) * depth_ratio
+    local cb = 1.0 + (rad_b - 1.0) * depth_ratio
+
+    local vx_x, vx_y, vy_x, vy_y = calc_rotated_uv_basis(widths[i + 1], heights[i + 1])
+
+    local target_up = (current_src == up_ping) and up_pong or up_ping
+    obj.clearbuffer(target_up, widths[i], heights[i])
+    obj.pixelshader(
+        "upsample_ps",
+        target_up,
+        { current_src, down_buf[i] },
+        {
+            vx_x, vx_y, vy_x, vy_y,
+            cr, cg, cb, core_scale,
+            wl, 0.0, 0.0, 0.0
+        },
+        "copy",
+        blur_sampler
+    )
+    current_src = target_up
+end
+
+local final_intensity = intensity / math.max(0.001, total_weight)
+
+obj.pixelshader(
+    "composite_ps",
+    "object",
+    { cache_orig, current_src },
+    {
+        final_intensity, tone_map, blend_mode, glow_area,
+        highlight_roll, is_preserve_hue, frame_seed, 0.0
+    },
+    "copy",
+    "clip"
+)
